@@ -5,8 +5,10 @@ __pycache__/
 
 # Folders
 /results/
+datasets/
 outputs/
 checkpoints/
+sigmadock_env/
 
 # Distribution / packaging
 .Python

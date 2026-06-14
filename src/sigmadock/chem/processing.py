@@ -309,6 +309,63 @@ def get_protein_ligand_edges(
     return edge_index, edge_attr, edge_entity
 
 
+
+def get_pp_interaction_edges(
+    pos: torch.Tensor,
+    node_entity: torch.Tensor,
+    frag_idx_map: torch.Tensor,
+    cutoff: float,
+    edge_dim: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Protein-protein interaction edges: receptor atoms (frag_idx=-1, protein_atom)
+    ↔ binder atoms (frag_idx>=0, protein_atom) within cutoff.
+    """
+    protein_atom_idx = HPARAMS.get_node_idx("protein_atom")
+    is_protein_atom = node_entity == protein_atom_idx
+
+    receptor_mask = is_protein_atom & (frag_idx_map < 0)
+    binder_mask = is_protein_atom & (frag_idx_map >= 0)
+
+    rec_idx = receptor_mask.nonzero(as_tuple=True)[0]
+    bnd_idx = binder_mask.nonzero(as_tuple=True)[0]
+
+    if rec_idx.numel() == 0 or bnd_idx.numel() == 0:
+        return (
+            torch.empty((2, 0), dtype=torch.long, device=pos.device),
+            torch.empty((0, edge_dim), dtype=pos.dtype, device=pos.device),
+            torch.empty((0,), dtype=torch.long, device=pos.device),
+        )
+
+    rec_pos = pos[rec_idx].cpu().numpy()
+    bnd_pos = pos[bnd_idx].cpu().numpy()
+
+    tree = cKDTree(bnd_pos)
+    pairs = tree.query_ball_point(rec_pos, r=cutoff)
+
+    src_list, dst_list = [], []
+    for i, js in enumerate(pairs):
+        for j in js:
+            src_list.append(rec_idx[i].item())
+            dst_list.append(bnd_idx[j].item())
+
+    if not src_list:
+        return (
+            torch.empty((2, 0), dtype=torch.long, device=pos.device),
+            torch.empty((0, edge_dim), dtype=pos.dtype, device=pos.device),
+            torch.empty((0,), dtype=torch.long, device=pos.device),
+        )
+
+    src = torch.tensor(src_list + dst_list, dtype=torch.long, device=pos.device)
+    dst = torch.tensor(dst_list + src_list, dtype=torch.long, device=pos.device)
+    edge_index = torch.stack([src, dst], dim=0)
+    E = edge_index.size(1)
+    edge_attr = torch.zeros((E, edge_dim), dtype=pos.dtype, device=pos.device)
+    edge_entity = torch.full((E,), HPARAMS.get_edge_idx("inter_complex"), dtype=torch.long, device=pos.device)
+    return edge_index, edge_attr, edge_entity
+
+
+
 # NOTE this works for a single datapoint -> batch_size=1
 def get_inter_fragment_edges(
     pos: torch.Tensor,
@@ -464,16 +521,31 @@ def _get_local_interactions(
     device, dtype = pos.device, pos.dtype
     ei1 = ea1 = ee1 = ei2 = ea2 = ee2 = ei3 = ea3 = ee3 = None
 
-    # --- Add protein-ligand interaction edges ---
+        # --- Add protein-ligand OR protein-protein interaction edges ---
     if cutoff_complex_interactions > 0:
-        ei1, ea1, ee1 = get_protein_ligand_edges(
-            pos,
-            node_entity,
-            cutoff_complex_interactions,
-            lig_just_atoms=lig_just_atoms,
-            edge_dim=edge_dim,
+        has_ligand = (
+            (node_entity == HPARAMS.get_node_idx("ligand_atom")).any()
+            or (node_entity == HPARAMS.get_node_idx("ligand_anchor")).any()
         )
-
+        if has_ligand:
+            ei1, ea1, ee1 = get_protein_ligand_edges(
+                pos,
+                node_entity,
+                cutoff_complex_interactions,
+                lig_just_atoms=lig_just_atoms,
+                edge_dim=edge_dim,
+            )
+        else:
+            # Protein-protein mode: receptor (frag_idx=-1) ↔ binder (frag_idx>=0)
+            frag_idx_map_local = frag_idx_map  # already passed as arg
+            ei1, ea1, ee1 = get_pp_interaction_edges(
+                pos,
+                node_entity,
+                frag_idx_map_local,
+                cutoff_complex_interactions,
+                edge_dim=edge_dim,
+            )
+            
     # --- Add inter-fragment edges ---
     if cutoff_fragments > 0:
         ei2, ea2, ee2 = get_inter_fragment_edges(pos, frag_idx_map, node_entity, cutoff_fragments, edge_dim=edge_dim)

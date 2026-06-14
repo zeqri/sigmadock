@@ -240,7 +240,13 @@ class SigmaDockDenoiser(nn.Module):
             ne = node_ent[s:e]
             m = mask[s:e]
 
-            valid = (fm >= 0) & (ne != HPARAMS.get_node_idx("ligand_virtual")) & (m)  # drop protein, virtuals, masked
+            # valid = (fm >= 0) & (ne != HPARAMS.get_node_idx("ligand_virtual")) & (m)  # drop protein, virtuals, masked
+            valid = (
+                   (fm >= 0)
+                   & (ne != HPARAMS.get_node_idx("ligand_virtual"))
+                   & (ne != HPARAMS.get_node_idx("protein_virtual"))
+                   & (m)
+                   )
             if not valid.any():
                 com_list.append(torch.empty((0, 3), device=pos.device))
                 rot_list.append(torch.empty((0, 3, 3), device=pos.device))

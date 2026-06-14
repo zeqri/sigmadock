@@ -18,6 +18,7 @@ from sigmadock.net.encoder import (
     ProteinResidueEncoder,
     RadialEmbeddingBlock,
 )
+
 from sigmadock.net.input_block import EdgeDegreeEmbedding
 from sigmadock.net.layer_norm import get_normalization_layer
 from sigmadock.net.module_list import ModuleListInfo
@@ -194,47 +195,21 @@ class EquiformerV2(nn.Module):
         if self.use_esm_embeddings:
             protein_virtual_addditional_feats.append(self.hparams.esm.embedding_dim)
 
-        # Loop through all defined node types from HPARAMS
-        for node_name, _ in self.hparams.node_entity.entity_indices.items():
-            if node_name in ["ligand_atom", "ligand_anchor", "ligand_dummy"]:
-                encoder = AtomDiffusionEncoder(
-                    emb_dim=self.sphere_channels_all,
-                    t_emb_dim=t_emb_dim,
-                    categorical_features=atom_feature_dims,
-                    linear_aggregate=False,
-                )
-            elif node_name == "protein_atom":
-                # Define additional features for protein atoms
-                encoder = AtomDiffusionEncoder(
-                    emb_dim=self.sphere_channels_all,
-                    t_emb_dim=t_emb_dim,
-                    categorical_features=atom_feature_dims,
-                    additional_features=protein_atom_additional_feats,
-                    linear_aggregate=False,
-                )
-            elif node_name == "ligand_virtual":
-                encoder = LigandVirtualEncoder(
-                    emb_dim=self.sphere_channels_all,
-                    t_emb_dim=t_emb_dim,
-                )
-                # Lig Virtual Encoder is an aggregator of connected ligand nodes
-                encoder = LigandVirtualDeepEncoder(
-                    input_dim=self.sphere_channels_all,
-                    output_dim=self.sphere_channels_all,
-                    t_emb_dim=t_emb_dim,
-                )
-            elif node_name == "protein_virtual":
-                encoder = AtomDiffusionEncoder(
-                    emb_dim=self.sphere_channels_all,
-                    t_emb_dim=t_emb_dim,
-                    categorical_features=[len(RESIDUE_MAP)],  # 20 standard residue types + 1 UNK
-                    additional_features=protein_virtual_addditional_feats,
-                    linear_aggregate=False,
-                )
-            else:
-                raise ValueError(f"Unknown node type '{node_name}' in HPARAMS.")
-
-            self.node_encoders[node_name] = encoder
+        
+        self.node_encoders["protein_atom"] = AtomDiffusionEncoder(
+            emb_dim=self.sphere_channels_all,
+            t_emb_dim=t_emb_dim,
+            categorical_features=atom_feature_dims,
+            additional_features=protein_atom_additional_feats,
+            linear_aggregate=False,
+        )
+        self.node_encoders["protein_virtual"] = AtomDiffusionEncoder(
+            emb_dim=self.sphere_channels_all,
+            t_emb_dim=t_emb_dim,
+            categorical_features=[len(RESIDUE_MAP)],
+            additional_features=protein_virtual_addditional_feats,
+            linear_aggregate=False,
+        )
 
         # ----------- Edge featurisation ----------------
         # Create a single ModuleDict for ALL chemistry-based edge encoders, keyed by edge name
@@ -251,25 +226,31 @@ class EquiformerV2(nn.Module):
         # Add chemistry edges
         chemistry_edge_names = self.hparams.edge_entity.entity_groups["chemistry"]
 
-        # Add other non-chemical edges (virtual-virtual, interaction, etc.)
-        for edge_name in chemistry_edge_names:
-            # Use the detailed ChemistryEdgeEncoder for these types
-            encoder = ChemistryEdgeEncoder(
-                edge_channels,
-                edge_feature_dims,
-                linear_aggregate=False,
-            )
-            self.chemistry_encoders[edge_name] = encoder
+        self.chemistry_encoders["protein_bonds"] = ChemistryEdgeEncoder(
+            edge_channels,
+            edge_feature_dims,
+            linear_aggregate=False,
+        )
 
         # ------------ Edge distance expansions -------------
         # Create a single ModuleDict for all distance encoders
         self.distance_encoders = nn.ModuleDict()
+
+                # Ligand-only edge types that don't exist in protein-protein data
+        _ligand_only_edges = {
+            "ligand_v2a", "ligand_v2v", "ligand_torsional_bond",
+            "fragment_triangulation", "ligand_anchor_dummy", "complex_lv2pv",
+        }
 
         for edge_name, edge_spec in self.hparams.get_edge_specs(
             list(self.hparams.edge_specs.keys()), use_scaling=True
         ).items():
             # Get the index of this edge type
             edge_idx = self.hparams.edge_entity.entity_indices[edge_name]
+
+            # Skip ligand-only edges not present in PP data
+            if edge_name in _ligand_only_edges:
+                continue
 
             # Skip edge types based on interaction settings
             if edge_name == "inter_complex" and not self.protein_ligand_interactions:
@@ -468,81 +449,28 @@ class EquiformerV2(nn.Module):
         # 3.1 Compute residue embeddings for protein atoms
         protein_residue_types = data.residue_types[is_protein]
         protein_residue_emb = self.residue_embedder(protein_residue_types)
+        # ---- STAGE 1: protein_atom nodes (receptor + binder heavy atoms) ----
+        # Shared encoder — receptor and binder are both proteins.
+        atom_mask = data.node_entity == self.hparams.get_node_idx("protein_atom")
+        if atom_mask.any():
+            pos_emb = data.protein_embeddings["positional_embeddings"][atom_mask]
+            res_emb = self.residue_embedder(data.residue_types[atom_mask])
+            features_in = torch.cat([data.x[atom_mask], res_emb, pos_emb], dim=1)
+            node_features_l0[atom_mask] = self.node_encoders["protein_atom"](
+                x=features_in, time_features=t_emb[atom_mask]
+            )
 
-        # ---- STAGE 1, COMPUTE REAL NODE FEATURES ----
-        node_names = {idx_to_name[idx.item()] for idx in data.node_entity.unique()}
-        virtuals = {a for a in node_names if "virtual" in a}
-        reals = node_names - virtuals
-
-        for node_name in reals:
-            node_idx = self.hparams.node_entity.entity_indices.get(node_name)
-            if node_idx is None:
-                continue
-
-            node_mask = data.node_entity == node_idx
-            if not node_mask.any():
-                continue
-
-            encoder = self.node_encoders[node_name]
-
-            if node_name == "protein_atom":
-                additional_features = [
-                    protein_residue_emb[is_protein_atom],
-                    data.protein_embeddings["positional_embeddings"][is_protein_atom],
-                ]
-                features_in = torch.cat([data.x[node_mask], *additional_features], dim=1)
-                node_features = encoder(x=features_in, time_features=t_emb[node_mask])
-                node_features_l0[node_mask] = node_features
-            else:  # ligand_atom, ligand_anchor, ligand_dummy
-                node_features = encoder(x=data.x[node_mask], time_features=t_emb[node_mask])
-                node_features_l0[node_mask] = node_features
-
-        # ---- STAGE 2, COMPUTE VIRTUAL NODE FEATURES ----
-        for node_name in virtuals:
-            node_idx = self.hparams.node_entity.entity_indices.get(node_name)
-            if node_idx is None:
-                continue
-
-            node_mask = data.node_entity == node_idx
-            if not node_mask.any():
-                continue
-
-            encoder = self.node_encoders[node_name]
-
-            if node_name == "ligand_virtual":
-                # Context-Aware Logic for Ligand Virtual Nodes
-                v2a_edge_mask = data.edge_entity == self.hparams.get_edge_idx("ligand_v2a")
-                v2a_edges = data.edge_index[:, v2a_edge_mask]
-
-                # We must filter the edges to ensure we only aggregate from real atoms TO virtual nodes, not the other way around.  # noqa: E501
-                dest_is_virtual = data.node_entity[v2a_edges[0]] == self.hparams.get_node_idx("ligand_virtual")
-                src_is_real = data.node_entity[v2a_edges[1]] != self.hparams.get_node_idx("ligand_virtual")
-
-                valid_edges = v2a_edges[:, dest_is_virtual & src_is_real]
-
-                virtual_nodes, real_atom_neighbors = valid_edges[0], valid_edges[1]
-                neighbor_features = node_features_l0[real_atom_neighbors]
-                aggregated_feats = scatter(
-                    neighbor_features,
-                    virtual_nodes,
-                    dim=0,
-                    dim_size=total_num_nodes,
-                    reduce="mean",
-                )
-
-                contextual_feats = aggregated_feats[node_mask]
-                node_features = encoder(contextual_feats, time_features=t_emb[node_mask])
-                node_features_l0[node_mask] = node_features
-
-            elif node_name == "protein_virtual":
-                # Protein virtual nodes use their residue type, as before
-                categorical_in = protein_residue_types[is_protein_virtual].unsqueeze(-1)
-                additional_features = []
-                if self.use_esm_embeddings:
-                    additional_features.append(data.protein_embeddings["esm_embeddings"][is_protein_virtual])
-                features_in = torch.cat([categorical_in, *additional_features], dim=1)
-                node_features = encoder(x=features_in, time_features=t_emb[node_mask])
-                node_features_l0[node_mask] = node_features
+        # ---- STAGE 2: protein_virtual nodes (Cα of receptor + binder) ----
+        virt_mask = data.node_entity == self.hparams.get_node_idx("protein_virtual")
+        if virt_mask.any():
+            categorical_in = data.residue_types[virt_mask].unsqueeze(-1)
+            additional_features = []
+            if self.use_esm_embeddings and data.protein_embeddings["esm_embeddings"] is not None:
+                additional_features.append(data.protein_embeddings["esm_embeddings"][virt_mask])
+            features_in = torch.cat([categorical_in, *additional_features], dim=1)
+            node_features_l0[virt_mask] = self.node_encoders["protein_virtual"](
+                x=features_in, time_features=t_emb[virt_mask]
+            )
 
         # Initialize the final SO3_Embedding tensor
         x_embedding = SO3_Embedding(
